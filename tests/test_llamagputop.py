@@ -693,5 +693,97 @@ class SeriesRetirement(Base):
         self.assertIn("kv_series@%s" % self.LIVE, lgt.HIST)
 
 
+
+
+class TestTaskProgressAndStats(Base):
+    """Task progress bar and last task stats in _llama_rows."""
+
+    def test_active_prefill_task_renders_bar_and_eta(self):
+        d = {
+            "alive": True,
+            "phase": "prefill",
+            "pp": 700.0,
+            "tg": None,
+            "ctx": 131072,
+            "active": 1,
+            "queued": 0,
+            "task": {
+                "id": 42,
+                "phase": "prefill",
+                "prompt_total": 1000,
+                "prompt_cache": 500,
+                "prompt_proc": 250,
+                "decoded": 0,
+                "budget": 0,
+                "pct": 0.75,
+                "eta": 0.357,
+            },
+            "task_last": None,
+        }
+        rows = lgt._llama_rows(d, 100)
+        text = "\n".join("".join(s[0] for s in r) for r in rows)
+        self.assertIn("task #42", text)
+        self.assertIn("75.0%", text)
+        self.assertIn("prefill 750/1000 tok", text)
+        self.assertIn("500 cached", text)
+        self.assertIn("ETA 0.4s", text)
+
+    def test_active_generating_task_renders_bar_and_eta(self):
+        d = {
+            "alive": True,
+            "phase": "generating",
+            "pp": None,
+            "tg": 25.0,
+            "ctx": 131072,
+            "active": 1,
+            "queued": 0,
+            "task": {
+                "id": 43,
+                "phase": "generating",
+                "prompt_total": 1000,
+                "prompt_cache": 1000,
+                "prompt_proc": 0,
+                "decoded": 100,
+                "budget": 500,
+                "pct": 0.20,
+                "eta": 16.0,
+            },
+            "task_last": None,
+        }
+        rows = lgt._llama_rows(d, 100)
+        text = "\n".join("".join(s[0] for s in r) for r in rows)
+        self.assertIn("task #43", text)
+        self.assertIn("20.0%", text)
+        self.assertIn("gen 100/500 tok", text)
+        self.assertIn("ETA 16.0s", text)
+
+    def test_idle_renders_last_task_stats(self):
+        d = {
+            "alive": True,
+            "phase": "idle",
+            "pp": None,
+            "tg": None,
+            "ctx": 131072,
+            "active": 0,
+            "queued": 0,
+            "task": None,
+            "task_last": {
+                "id": 42,
+                "prompt_total": 10000,
+                "prompt_cache": 8000,
+                "decoded": 250,
+                "elapsed": 12.5,
+                "pp": 650.0,
+                "tg": 28.5,
+            },
+        }
+        rows = lgt._llama_rows(d, 100)
+        text = "\n".join("".join(s[0] for s in r) for r in rows)
+        self.assertIn("last task #42", text)
+        self.assertIn("250 gen tok", text)
+        self.assertIn("from 10000 prompt (8000 cached)", text)
+        self.assertIn("in 12.5s (pp 650 t/s, gen 28.5 t/s)", text)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

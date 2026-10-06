@@ -1521,6 +1521,8 @@ class LlamaProbe:
         self.model = ""
         self.model_at = 0.0
         self._rf = None                    # reasoning format (from /slots, survives ticks)
+        self.task_last = None
+        self._cur_task = None
 
     def _get(self, path, timeout=2.5):
         import urllib.request
@@ -1619,7 +1621,7 @@ class LlamaProbe:
              "spec_nmax": None, "spec_stale": False, "cache_hit": 0, "prompt_new": 0,
              "max_tok": None, "reuse": None, "budget": 0, "decoded": 0, "kv_used": 0,
              "metrics_off": False, "slots_off": False, "stale": False, "kv_cap": None,
-             "active_metric": None}
+             "active_metric": None, "task": None, "task_last": self.task_last}
 
     def sample(self):
         import json, time
@@ -1750,6 +1752,12 @@ class LlamaProbe:
             _bdec = (_bn.get("n_decoded") or 0) if busy_slots else 0
             d["budget"] = (_bdec + resta) if isinstance(resta, int) and resta >= 0 else 0
             _nproc = sum((sl.get("n_prompt_tokens_processed") or 0) for sl in busy_slots)
+            _bs0 = busy_slots[0] if busy_slots else {}
+            _tid = _bs0.get("id_task")
+            _nptot = _bs0.get("n_prompt_tokens", 0) or 0
+            _npcache = _bs0.get("n_prompt_tokens_cache", 0) or 0
+            _npred = (_bs0.get("params", {}) or {}).get("n_predict") or (_bs0.get("params", {}) or {}).get("max_tokens") or 0
+            _tbudget = d["budget"] or (_npred if isinstance(_npred, int) and _npred > 0 else 0)
             # the number of slots actually working is a live reading of the queue depth,
             # and unlike llamacpp:requests_processing it needs no --metrics
             # Direct observation beats a counter here: the number of slots actually
@@ -1771,6 +1779,32 @@ class LlamaProbe:
             # not left to age out: what stands after a request is the last rate, and it
             # is labelled as such rather than dressed up as the current one.
             if busy:
+                if self._cur_task and _tid is not None and self._cur_task.get("id") != _tid:
+                    self.task_last = {
+                        "id": self._cur_task.get("id"),
+                        "prompt_total": self._cur_task.get("prompt_total", 0),
+                        "prompt_cache": self._cur_task.get("prompt_cache", 0),
+                        "decoded": self._cur_task.get("decoded", 0),
+                        "elapsed": max(0.0, now - self._cur_task.get("t_start", now)),
+                        "pp": self.pp_last,
+                        "tg": self.tg_last,
+                    }
+                    self._cur_task = None
+                if not self._cur_task:
+                    self._cur_task = {
+                        "id": _tid,
+                        "t_start": now,
+                        "prompt_total": _nptot,
+                        "prompt_cache": _npcache,
+                        "decoded": dec,
+                    }
+                else:
+                    if _nptot:
+                        self._cur_task["prompt_total"] = _nptot
+                    if _npcache:
+                        self._cur_task["prompt_cache"] = _npcache
+                    if dec:
+                        self._cur_task["decoded"] = dec
                 r = self._slope(self._dhist, dec, self._dlast)
                 if r is not None:
                     self.tg = r
@@ -1783,12 +1817,49 @@ class LlamaProbe:
                     self.tg_last = self.tg
                 if self.pp is not None:
                     self.pp_last = self.pp
+                if self._cur_task:
+                    self.task_last = {
+                        "id": self._cur_task.get("id"),
+                        "prompt_total": self._cur_task.get("prompt_total", 0),
+                        "prompt_cache": self._cur_task.get("prompt_cache", 0),
+                        "decoded": self._cur_task.get("decoded", 0),
+                        "elapsed": max(0.0, now - self._cur_task.get("t_start", now)),
+                        "pp": self.pp_last,
+                        "tg": self.tg_last,
+                    }
+                    self._cur_task = None
                 self._dhist.clear(); self._phist.clear()
                 self.tg = self.pp = None
             else:
                 self.tg = self.pp = None
             self._dlast, self._plast, self._busy = dec, _nproc, busy
             d["phase"] = "generating" if (busy and dec > 0) else "prefill" if busy else "idle"
+            if busy:
+                if d["phase"] == "prefill":
+                    cur_p = min(_nptot, _npcache + _nproc)
+                    pct = cur_p / _nptot if _nptot > 0 else 0.0
+                    rem = max(0, _nptot - _npcache - _nproc)
+                    r = self.pp or self.pp_last or d.get("pp_life")
+                    eta = (rem / r) if (r and r > 0 and rem > 0) else (0.0 if rem == 0 else None)
+                else:
+                    pct = min(1.0, dec / _tbudget) if _tbudget > 0 else 0.0
+                    rem = max(0, _tbudget - dec) if _tbudget > 0 else None
+                    r = self.tg or self.tg_last or d.get("tg_life")
+                    eta = (rem / r) if (r and r > 0 and rem is not None) else None
+                d["task"] = {
+                    "id": _tid,
+                    "phase": d["phase"],
+                    "prompt_total": _nptot,
+                    "prompt_cache": _npcache,
+                    "prompt_proc": _nproc,
+                    "decoded": dec,
+                    "budget": _tbudget,
+                    "pct": pct,
+                    "eta": eta,
+                }
+            else:
+                d["task"] = None
+            d["task_last"] = self.task_last
             nctx = x.get("n_ctx", 0) or 0
             if not isinstance(nctx, int) or nctx < 0:
                 nctx = 0                       # a negative context is not a context
@@ -2784,6 +2855,59 @@ def _llama_rows(d, width):
         speed.append([("metrics off", WARN),
                       (" — start with --metrics for reuse, queue and session averages", DIM)])
     rows += _flow(speed, inner)
+    # task progress bar (active task during prefill/gen or last completed task summary)
+    task = d.get("task")
+    if task:
+        bw = max(8, min(16, inner // 6))
+        t_id = f"#{task['id']} " if task.get("id") is not None else ""
+        pct = task.get("pct", 0.0)
+        eta = task.get("eta")
+        eta_str = f"ETA {eta:.1f}s" if eta is not None and eta < 60 else f"ETA {int(eta // 60)}m{int(eta % 60):02d}s" if eta is not None else ""
+        t_cells = []
+        if task.get("phase") == "prefill":
+            ptot = task.get("prompt_total", 0)
+            pcache = task.get("prompt_cache", 0)
+            pproc = task.get("prompt_proc", 0)
+            cur_p = min(ptot, pcache + pproc)
+            bar_cell = [("task ", DIM), (t_id, 0)] + _bar(pct, 1.0, bw, OK) + [(f" {pct * 100:.1f}%", 0)]
+            t_cells.append(bar_cell)
+            t_cells.append([(f"prefill {cur_p}/{ptot} tok", 0)])
+            if pcache > 0:
+                t_cells.append([(f"({pcache} cached)", DIM)])
+        else:
+            dec = task.get("decoded", 0)
+            bg = task.get("budget", 0)
+            if bg:
+                bar_cell = [("task ", DIM), (t_id, 0)] + _bar(pct, 1.0, bw, OK) + [(f" {pct * 100:.1f}%", 0)]
+                t_cells.append(bar_cell)
+                t_cells.append([(f"gen {dec}/{bg} tok", 0)])
+            else:
+                t_cells.append([("task ", DIM), (t_id, 0), (f"gen {dec} tok", 0)])
+        if eta_str:
+            t_cells.append([(eta_str, OK)])
+        rows += _flow(t_cells, inner)
+    elif d.get("task_last"):
+        tl = d["task_last"]
+        t_id = f"#{tl['id']} " if tl.get("id") is not None else ""
+        dec = tl.get("decoded", 0)
+        ptot = tl.get("prompt_total", 0)
+        pcache = tl.get("prompt_cache", 0)
+        el = tl.get("elapsed")
+        l_cells = [[("last task ", DIM), (t_id, 0), (f"{dec} gen tok", 0)]]
+        if ptot:
+            prompt_str = f"from {ptot} prompt"
+            if pcache:
+                prompt_str += f" ({pcache} cached)"
+            l_cells.append([(prompt_str, DIM)])
+        if el:
+            rates = []
+            if tl.get("pp"):
+                rates.append(f"pp {tl['pp']:.0f} t/s")
+            if tl.get("tg"):
+                rates.append(f"gen {tl['tg']:.1f} t/s")
+            rate_str = f" ({', '.join(rates)})" if rates else ""
+            l_cells.append([(f"in {el:.1f}s{rate_str}", DIM)])
+        rows += _flow(l_cells, inner)
     # kv fill, how deep the context has ever gone, the generation budget, prompt reuse
     if d.get("kv") is not None:
         kv = d["kv"]
